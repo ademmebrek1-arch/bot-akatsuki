@@ -1,0 +1,1076 @@
+import os
+import json
+import random
+import asyncio
+from datetime import datetime, timedelta, timezone
+import discord
+from discord.ext import commands
+
+WARNS_FILE = "warns.json"
+OWNERS_FILE = "owners.json"
+MAX_WARNS = 3
+
+# ── Anti-raid state (in memory) ────────────────────────────────
+RAID_THRESHOLD = 5       # membres en
+RAID_WINDOW    = 10      # secondes → raid détecté
+antiraid_enabled = {}    # {guild_id: bool}
+join_log         = {}    # {guild_id: [datetime, ...]}
+raid_active      = {}    # {guild_id: bool}
+
+# ── Anti-spam state (in memory) ────────────────────────────────
+SPAM_LIMIT  = 5          # même message X fois
+SPAM_WINDOW = 10         # en Y secondes → ban auto
+spam_log    = {}         # {(guild_id, user_id): [(content, datetime), ...]}
+
+# ── Warns helpers ──────────────────────────────────────────────
+
+def load_warns():
+    if os.path.exists(WARNS_FILE):
+        with open(WARNS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_warns(data):
+    with open(WARNS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def get_user_warns(guild_id, user_id):
+    data = load_warns()
+    return data.get(str(guild_id), {}).get(str(user_id), [])
+
+def add_warn(guild_id, user_id, reason, by):
+    data = load_warns()
+    guild_data = data.setdefault(str(guild_id), {})
+    user_warns = guild_data.setdefault(str(user_id), [])
+    user_warns.append({
+        "reason": reason,
+        "by": by,
+        "at": datetime.utcnow().strftime("%d/%m/%Y %H:%M UTC")
+    })
+    save_warns(data)
+    return len(user_warns)
+
+def clear_warns(guild_id, user_id):
+    data = load_warns()
+    data.get(str(guild_id), {}).pop(str(user_id), None)
+    save_warns(data)
+
+# ── Owners helpers ─────────────────────────────────────────────
+
+def load_owners():
+    if os.path.exists(OWNERS_FILE):
+        with open(OWNERS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_owners(data):
+    with open(OWNERS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def is_bot_owner(guild_id, user_id):
+    data = load_owners()
+    return user_id in data.get(str(guild_id), [])
+
+def add_bot_owner(guild_id, user_id):
+    data = load_owners()
+    owners = data.setdefault(str(guild_id), [])
+    if user_id not in owners:
+        owners.append(user_id)
+    save_owners(data)
+
+def remove_bot_owner(guild_id, user_id):
+    data = load_owners()
+    owners = data.get(str(guild_id), [])
+    if user_id in owners:
+        owners.remove(user_id)
+    save_owners(data)
+
+# ── Custom permission check ────────────────────────────────────
+
+def bot_owner_or_permission(**perms):
+    async def predicate(ctx):
+        if ctx.guild and is_bot_owner(ctx.guild.id, ctx.author.id):
+            return True
+        missing = [
+            perm for perm, value in perms.items()
+            if getattr(ctx.author.guild_permissions, perm, None) != value
+        ]
+        if missing:
+            raise commands.MissingPermissions(missing)
+        return True
+    return commands.check(predicate)
+
+# ── Bot setup ──────────────────────────────────────────────────
+
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+# ── Security helper ────────────────────────────────────────────
+
+async def derank_member(guild, member, channel=None):
+    roles_to_remove = [
+        r for r in member.roles
+        if r != guild.default_role and r < guild.me.top_role
+    ]
+    if roles_to_remove:
+        await member.remove_roles(*roles_to_remove, reason="Sécurité : ban sans raison")
+    if channel:
+        await channel.send(
+            f"🔒 **Système de sécurité** : **{member.name}** a banni quelqu'un sans raison "
+            f"et a été automatiquement deranké de tous ses rôles."
+        )
+
+# ── Events ─────────────────────────────────────────────────────
+
+@bot.event
+async def on_ready():
+    print("---------------------------------------")
+    print(f"Le bot {bot.user.name} est en ligne ! 🔥")
+    print("---------------------------------------")
+
+@bot.event
+async def on_message(message):
+    if message.author.bot or not message.guild:
+        await bot.process_commands(message)
+        return
+    gid = message.guild.id
+    uid = message.author.id
+    key = (gid, uid)
+    content = message.content.strip().lower()
+    if not content:
+        await bot.process_commands(message)
+        return
+    now = datetime.now(timezone.utc)
+    history = spam_log.setdefault(key, [])
+    history.append((content, now))
+    spam_log[key] = [(c, t) for c, t in history if (now - t).total_seconds() <= SPAM_WINDOW]
+    same = [c for c, t in spam_log[key] if c == content]
+    if len(same) >= SPAM_LIMIT:
+        spam_log[key] = []
+        try:
+            await message.author.send(
+                f"🚫 Tu as été **banni automatiquement** de **{message.guild.name}** "
+                f"pour spam répétitif ({SPAM_LIMIT} messages identiques en {SPAM_WINDOW}s)."
+            )
+        except discord.Forbidden:
+            pass
+        await message.author.ban(reason=f"Anti-spam : {SPAM_LIMIT} messages identiques en {SPAM_WINDOW}s")
+        channel = message.channel
+        embed = discord.Embed(
+            title="🚫 Anti-Spam — Ban automatique",
+            description=(
+                f"**{message.author.name}** a été **banni** automatiquement.\n"
+                f"**Raison :** {SPAM_LIMIT} messages identiques envoyés en moins de {SPAM_WINDOW} secondes.\n"
+                f"**Message :** `{message.content[:100]}`"
+            ),
+            color=discord.Color.red()
+        )
+        await channel.send(embed=embed)
+        return
+    await bot.process_commands(message)
+
+@bot.event
+async def on_member_join(member):
+    guild = member.guild
+    gid = guild.id
+    if not antiraid_enabled.get(gid, False):
+        return
+    now = datetime.now(timezone.utc)
+    joins = join_log.setdefault(gid, [])
+    joins.append(now)
+    join_log[gid] = [t for t in joins if (now - t).total_seconds() <= RAID_WINDOW]
+    if len(join_log[gid]) >= RAID_THRESHOLD and not raid_active.get(gid, False):
+        raid_active[gid] = True
+        channel = guild.system_channel or next(
+            (c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None
+        )
+        recent_joins = [t for t in join_log[gid]]
+        join_log[gid] = []
+        kicked = 0
+        for m in list(guild.members):
+            if m.bot or m == guild.me:
+                continue
+            joined = m.joined_at
+            if joined and any(abs((joined - t).total_seconds()) <= RAID_WINDOW for t in recent_joins):
+                try:
+                    await m.kick(reason="🚨 Anti-raid : kick automatique")
+                    kicked += 1
+                except discord.Forbidden:
+                    pass
+        for ch in guild.text_channels:
+            try:
+                ow = ch.overwrites_for(guild.default_role)
+                ow.send_messages = False
+                await ch.set_permissions(guild.default_role, overwrite=ow)
+            except discord.Forbidden:
+                pass
+        if channel:
+            embed = discord.Embed(
+                title="🚨 RAID DÉTECTÉ — Protection activée",
+                description=(
+                    f"**{len(recent_joins)} membres** ont rejoint en moins de **{RAID_WINDOW} secondes**.\n\n"
+                    f"✅ **{kicked} membre(s) kické(s)** automatiquement.\n"
+                    f"🔒 **Tous les salons verrouillés.**\n\n"
+                    f"Utilise `!antiraid off` puis `!unlock` dans chaque salon quand c'est calme."
+                ),
+                color=discord.Color.red()
+            )
+            await channel.send(embed=embed)
+        await asyncio.sleep(30)
+        raid_active[gid] = False
+
+@bot.event
+async def on_member_ban(guild, user):
+    await asyncio.sleep(2)
+    try:
+        async for entry in guild.audit_logs(action=discord.AuditLogAction.ban, limit=5):
+            if entry.target.id == user.id:
+                if not entry.reason:
+                    banner = guild.get_member(entry.user.id)
+                    if banner and banner != guild.me:
+                        channel = guild.system_channel or next(
+                            (c for c in guild.text_channels if c.permissions_for(guild.me).send_messages),
+                            None
+                        )
+                        await derank_member(guild, banner, channel)
+                break
+    except discord.Forbidden:
+        pass
+
+# ── Commands ───────────────────────────────────────────────────
+
+@bot.command(name="help", aliases=["aide"])
+async def help_command(ctx):
+    embed = discord.Embed(
+        title="📖 Mode d'emploi du bot",
+        description="Voici toutes les commandes disponibles. Le préfixe est `!`",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="🌐 Général",
+        value=(
+            "`!ping` — Vérifie si le bot répond\n"
+            "`!itachi` — Citation d'Itachi 👁️\n"
+            "`!help` — Affiche ce message"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🔨 Modération",
+        value=(
+            "`!ban @user [raison]` — Bannit un membre *(sans raison = auto-derank)*\n"
+            "`!warn @user raison` — Avertit un membre *(3 warns = ban auto)*\n"
+            "`!warns @user` — Voir les avertissements d'un membre\n"
+            "`!clearwarns @user` — Effacer les avertissements\n"
+            "`!mute @user durée [raison]` — Met en sourdine *(ex: 10m, 1h, 2j)*\n"
+            "`!unmute @user` — Retire la sourdine"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🎭 Rôles",
+        value=(
+            "`!rank @user NomDuRôle` — Donne un rôle à un membre\n"
+            "`!derank @user NomDuRôle` — Retire un rôle à un membre"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🔒 Salons",
+        value=(
+            "`!lock` — Verrouille le salon *(seuls les owners peuvent écrire)*\n"
+            "`!unlock` — Déverrouille le salon\n"
+            "`!clear nombre` — Supprime X messages *(max 100)*"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🛡️ Anti-Raid",
+        value=(
+            "`!antiraid on` — Active la protection anti-raid\n"
+            "`!antiraid off` — Désactive la protection\n"
+            "`!antiraid` — Voir le statut actuel\n"
+            f"*Déclenché si {RAID_THRESHOLD}+ membres rejoignent en {RAID_WINDOW}s → kick auto + lock*"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🚫 Anti-Spam (automatique)",
+        value=(
+            f"*Toujours actif — si quelqu'un envoie le même message **{SPAM_LIMIT}x** "
+            f"en moins de **{SPAM_WINDOW}s**, il est banni automatiquement.*"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🎮 Jeux & Coins",
+        value=(
+            "`!mines <mise>` — Lance une partie de Mines 💎\n"
+            "`!balance [@user]` — Voir son solde de coins 💰\n"
+            "`!daily` — Réclamer ses 500 coins quotidiens 🎁\n"
+            f"*Nouveau joueur = {STARTING_COINS} coins de départ*"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="👑 Owner Bot",
+        value=(
+            "`!owner @user` — Donne le statut owner *(accès total au bot)*\n"
+            "`!rmowner @user` — Retire le statut owner\n"
+            "`!owners` — Liste des bot owners"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🔐 Permissions requises",
+        value=(
+            "Les commandes de modération nécessitent les permissions Discord correspondantes, "
+            "**ou** d'être **bot owner** pour tout bypasser."
+        ),
+        inline=False
+    )
+    embed.set_footer(text=f"Demandé par {ctx.author.name}", icon_url=ctx.author.display_avatar.url)
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def ping(ctx):
+    await ctx.send("Pong ! 🏓")
+
+@bot.command()
+async def itachi(ctx):
+    await ctx.send("Dans ce monde, ceux qui enfreignent les règles sont de la vermine... mais ceux qui abandonnent leurs amis sont pires que de la vermine. 👁️‍🗨️")
+
+@bot.command()
+@bot_owner_or_permission(ban_members=True)
+async def ban(ctx, member: discord.Member = None, *, reason: str = None):
+    if member is None:
+        await ctx.send("❌ Mentionne un membre à bannir. Exemple : `!ban @utilisateur raison`")
+        return
+    if member == ctx.author:
+        await ctx.send("❌ Tu ne peux pas te bannir toi-même !")
+        return
+    if member.top_role >= ctx.author.top_role and not is_bot_owner(ctx.guild.id, ctx.author.id):
+        await ctx.send("❌ Tu ne peux pas bannir un membre avec un rôle égal ou supérieur au tien.")
+        return
+    if reason is None:
+        await member.ban(reason="Aucune raison fournie")
+        await ctx.send(f"🔨 **{member.name}** a été banni.")
+        await derank_member(ctx.guild, ctx.author, ctx.channel)
+    else:
+        await member.ban(reason=reason)
+        await ctx.send(f"🔨 **{member.name}** a été banni. Raison : *{reason}*")
+
+@ban.error
+async def ban_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Tu n'as pas la permission de bannir des membres.")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Membre introuvable. Vérifie la mention ou l'ID.")
+    elif isinstance(error, discord.Forbidden):
+        await ctx.send("❌ Je n'ai pas la permission de bannir ce membre. Vérifie mon rôle.")
+
+@bot.command()
+@bot_owner_or_permission(manage_roles=True)
+async def rank(ctx, member: discord.Member = None, *, role_name: str = None):
+    if member is None or role_name is None:
+        await ctx.send("❌ Utilisation : `!rank @utilisateur NomDuRôle`")
+        return
+    role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), ctx.guild.roles)
+    if role is None:
+        await ctx.send(f"❌ Le rôle **{role_name}** est introuvable. Vérifie l'orthographe.")
+        return
+    if role >= ctx.guild.me.top_role:
+        await ctx.send("❌ Je ne peux pas attribuer ce rôle car il est supérieur ou égal au mien.")
+        return
+    if role in member.roles:
+        await ctx.send(f"ℹ️ **{member.name}** a déjà le rôle **{role.name}**.")
+        return
+    await member.add_roles(role)
+    await ctx.send(f"✅ Le rôle **{role.name}** a été attribué à **{member.name}** !")
+
+@rank.error
+async def rank_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Tu n'as pas la permission de gérer les rôles.")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Membre introuvable. Vérifie la mention.")
+    elif isinstance(error, discord.Forbidden):
+        await ctx.send("❌ Je n'ai pas la permission d'attribuer ce rôle. Vérifie mon rôle.")
+
+@bot.command()
+@bot_owner_or_permission(manage_roles=True)
+async def derank(ctx, member: discord.Member = None, *, role_name: str = None):
+    if member is None or role_name is None:
+        await ctx.send("❌ Utilisation : `!derank @utilisateur NomDuRôle`")
+        return
+    role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), ctx.guild.roles)
+    if role is None:
+        await ctx.send(f"❌ Le rôle **{role_name}** est introuvable. Vérifie l'orthographe.")
+        return
+    if role >= ctx.guild.me.top_role:
+        await ctx.send("❌ Je ne peux pas retirer ce rôle car il est supérieur ou égal au mien.")
+        return
+    if role not in member.roles:
+        await ctx.send(f"ℹ️ **{member.name}** n'a pas le rôle **{role.name}**.")
+        return
+    await member.remove_roles(role)
+    await ctx.send(f"✅ Le rôle **{role.name}** a été retiré à **{member.name}** !")
+
+@derank.error
+async def derank_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Tu n'as pas la permission de gérer les rôles.")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Membre introuvable. Vérifie la mention.")
+    elif isinstance(error, discord.Forbidden):
+        await ctx.send("❌ Je n'ai pas la permission de retirer ce rôle. Vérifie mon rôle.")
+
+@bot.command()
+@bot_owner_or_permission(kick_members=True)
+async def warn(ctx, member: discord.Member = None, *, reason: str = None):
+    if member is None or reason is None:
+        await ctx.send("❌ Utilisation : `!warn @utilisateur raison`")
+        return
+    if member == ctx.author:
+        await ctx.send("❌ Tu ne peux pas te warn toi-même !")
+        return
+    if member.bot:
+        await ctx.send("❌ Tu ne peux pas warn un bot.")
+        return
+    count = add_warn(ctx.guild.id, member.id, reason, ctx.author.name)
+    try:
+        await member.send(
+            f"⚠️ Tu as reçu un avertissement sur **{ctx.guild.name}**.\n"
+            f"**Raison :** {reason}\n"
+            f"**Par :** {ctx.author.name}\n"
+            f"**Avertissements :** {count}/{MAX_WARNS}"
+        )
+    except discord.Forbidden:
+        pass
+    if count >= MAX_WARNS:
+        clear_warns(ctx.guild.id, member.id)
+        await ctx.send(
+            f"⚠️ **{member.name}** a reçu son **{count}ème avertissement** (raison : *{reason}*).\n"
+            f"🔨 Il a atteint **{MAX_WARNS} warns** et a été automatiquement **banni** !"
+        )
+        await member.ban(reason=f"Banni automatiquement après {MAX_WARNS} avertissements.")
+    else:
+        remaining = MAX_WARNS - count
+        await ctx.send(
+            f"⚠️ **{member.name}** a reçu un avertissement ({count}/{MAX_WARNS}). Raison : *{reason}*\n"
+            f"{'⛔ Encore **1 warn** avant le ban !' if remaining == 1 else f'Il lui reste **{remaining} warns** avant le ban.'}"
+        )
+
+@warn.error
+async def warn_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Tu n'as pas la permission de warn des membres.")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Membre introuvable. Vérifie la mention.")
+
+@bot.command()
+@bot_owner_or_permission(kick_members=True)
+async def warns(ctx, member: discord.Member = None):
+    if member is None:
+        await ctx.send("❌ Utilisation : `!warns @utilisateur`")
+        return
+    user_warns = get_user_warns(ctx.guild.id, member.id)
+    if not user_warns:
+        await ctx.send(f"✅ **{member.name}** n'a aucun avertissement.")
+        return
+    embed = discord.Embed(title=f"⚠️ Avertissements de {member.name}", color=discord.Color.orange())
+    for i, w in enumerate(user_warns, 1):
+        embed.add_field(
+            name=f"Warn #{i} — {w['at']}",
+            value=f"**Raison :** {w['reason']}\n**Par :** {w['by']}",
+            inline=False
+        )
+    embed.set_footer(text=f"{len(user_warns)}/{MAX_WARNS} avertissements")
+    await ctx.send(embed=embed)
+
+@bot.command()
+@bot_owner_or_permission(kick_members=True)
+async def clearwarns(ctx, member: discord.Member = None):
+    if member is None:
+        await ctx.send("❌ Utilisation : `!clearwarns @utilisateur`")
+        return
+    clear_warns(ctx.guild.id, member.id)
+    await ctx.send(f"✅ Les avertissements de **{member.name}** ont été effacés.")
+
+# ── Mute system ────────────────────────────────────────────────
+
+def parse_duration(duration_str):
+    units = {"s": 1, "m": 60, "h": 3600, "j": 86400, "d": 86400}
+    unit = duration_str[-1].lower()
+    if unit not in units:
+        return None
+    try:
+        value = int(duration_str[:-1])
+        return timedelta(seconds=value * units[unit])
+    except ValueError:
+        return None
+
+@bot.command()
+@bot_owner_or_permission(moderate_members=True)
+async def mute(ctx, member: discord.Member = None, duration: str = None, *, reason: str = "Aucune raison fournie"):
+    if member is None or duration is None:
+        await ctx.send("❌ Utilisation : `!mute @utilisateur durée [raison]`\nExemples : `!mute @user 10m spam`, `!mute @user 1h flood`, `!mute @user 2j toxicité`\nUnités : `s` secondes, `m` minutes, `h` heures, `j` jours")
+        return
+    if member == ctx.author:
+        await ctx.send("❌ Tu ne peux pas te mute toi-même !")
+        return
+    if member.bot:
+        await ctx.send("❌ Tu ne peux pas mute un bot.")
+        return
+    delta = parse_duration(duration)
+    if delta is None:
+        await ctx.send("❌ Durée invalide. Exemples valides : `10m`, `1h`, `2j`, `30s`")
+        return
+    max_delta = timedelta(days=28)
+    if delta > max_delta:
+        await ctx.send("❌ La durée maximale de mute est de **28 jours**.")
+        return
+    until = datetime.now(timezone.utc) + delta
+    await member.timeout(until, reason=reason)
+    try:
+        await member.send(
+            f"🔇 Tu as été mis en sourdine sur **{ctx.guild.name}**.\n"
+            f"**Durée :** {duration}\n"
+            f"**Raison :** {reason}\n"
+            f"**Par :** {ctx.author.name}"
+        )
+    except discord.Forbidden:
+        pass
+    await ctx.send(f"🔇 **{member.name}** a été mis en sourdine pendant **{duration}**. Raison : *{reason}*")
+
+@mute.error
+async def mute_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Tu n'as pas la permission de mettre en sourdine.")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Membre introuvable. Vérifie la mention.")
+    elif isinstance(error, discord.Forbidden):
+        await ctx.send("❌ Je ne peux pas mute ce membre. Vérifie mon rôle.")
+
+@bot.command()
+@bot_owner_or_permission(moderate_members=True)
+async def unmute(ctx, member: discord.Member = None):
+    if member is None:
+        await ctx.send("❌ Utilisation : `!unmute @utilisateur`")
+        return
+    if member.timed_out_until is None:
+        await ctx.send(f"ℹ️ **{member.name}** n'est pas en sourdine.")
+        return
+    await member.timeout(None)
+    await ctx.send(f"🔊 **{member.name}** n'est plus en sourdine.")
+
+@unmute.error
+async def unmute_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Tu n'as pas la permission de retirer la sourdine.")
+    elif isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Membre introuvable. Vérifie la mention.")
+
+# ── Clear command ──────────────────────────────────────────────
+
+@bot.command()
+@bot_owner_or_permission(manage_messages=True)
+async def clear(ctx, amount: int = None):
+    if amount is None:
+        await ctx.send("❌ Utilisation : `!clear nombre` (ex: `!clear 10`)")
+        return
+    if amount < 1 or amount > 100:
+        await ctx.send("❌ Le nombre doit être entre **1** et **100**.")
+        return
+    await ctx.message.delete()
+    deleted = await ctx.channel.purge(limit=amount)
+    msg = await ctx.send(f"🗑️ **{len(deleted)} message(s)** supprimé(s).")
+    await asyncio.sleep(3)
+    await msg.delete()
+
+@clear.error
+async def clear_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Tu n'as pas la permission de supprimer des messages.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("❌ Mets un nombre valide. Exemple : `!clear 10`")
+
+# ── Anti-raid command ──────────────────────────────────────────
+
+@bot.command()
+@bot_owner_or_permission(administrator=True)
+async def antiraid(ctx, action: str = None):
+    gid = ctx.guild.id
+    if action is None:
+        status = "🟢 **Activé**" if antiraid_enabled.get(gid, False) else "🔴 **Désactivé**"
+        await ctx.send(
+            f"🛡️ Anti-raid : {status}\n"
+            f"Utilise `!antiraid on` pour activer ou `!antiraid off` pour désactiver."
+        )
+        return
+    if action.lower() == "on":
+        antiraid_enabled[gid] = True
+        join_log[gid] = []
+        raid_active[gid] = False
+        embed = discord.Embed(
+            title="🛡️ Anti-Raid activé",
+            description=(
+                f"La protection anti-raid est **active**.\n\n"
+                f"Si **{RAID_THRESHOLD} membres ou plus** rejoignent en moins de **{RAID_WINDOW} secondes**, le bot va :\n"
+                f"🦶 Kicker automatiquement tous les nouveaux membres suspects\n"
+                f"🔒 Verrouiller tous les salons\n"
+                f"🚨 Envoyer une alerte dans ce salon"
+            ),
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+    elif action.lower() == "off":
+        antiraid_enabled[gid] = False
+        join_log[gid] = []
+        raid_active[gid] = False
+        await ctx.send("🛡️ Anti-raid **désactivé**. Le serveur est en mode normal.")
+    else:
+        await ctx.send("❌ Action invalide. Utilise `!antiraid on` ou `!antiraid off`.")
+
+@antiraid.error
+async def antiraid_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Tu n'as pas la permission d'activer l'anti-raid.")
+
+# ── Lock system ────────────────────────────────────────────────
+
+@bot.command()
+@bot_owner_or_permission(manage_channels=True)
+async def lock(ctx):
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    if overwrite.send_messages is False:
+        await ctx.send("🔒 Ce salon est déjà verrouillé.")
+        return
+    overwrite.send_messages = False
+    await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
+    for uid in load_owners().get(str(ctx.guild.id), []):
+        member = ctx.guild.get_member(uid)
+        if member:
+            await ctx.channel.set_permissions(member, send_messages=True)
+    await ctx.send("🔒 **Salon verrouillé.** Seuls les bot owners peuvent écrire ici.")
+
+@lock.error
+async def lock_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Tu n'as pas la permission de gérer les salons.")
+
+@bot.command()
+@bot_owner_or_permission(manage_channels=True)
+async def unlock(ctx):
+    overwrite = ctx.channel.overwrites_for(ctx.guild.default_role)
+    if overwrite.send_messages is not False:
+        await ctx.send("🔓 Ce salon est déjà déverrouillé.")
+        return
+    overwrite.send_messages = None
+    await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
+    for uid in load_owners().get(str(ctx.guild.id), []):
+        member = ctx.guild.get_member(uid)
+        if member:
+            await ctx.channel.set_permissions(member, overwrite=None)
+    await ctx.send("🔓 **Salon déverrouillé.** Tout le monde peut écrire à nouveau.")
+
+@unlock.error
+async def unlock_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Tu n'as pas la permission de gérer les salons.")
+
+# ── Owner system ───────────────────────────────────────────────
+
+@bot.command()
+async def owner(ctx, member: discord.Member = None):
+    if member is None:
+        await ctx.send("❌ Utilisation : `!owner @utilisateur`")
+        return
+    is_guild_owner = ctx.author.id == ctx.guild.owner_id
+    is_already_owner = is_bot_owner(ctx.guild.id, ctx.author.id)
+    if not is_guild_owner and not is_already_owner:
+        await ctx.send("❌ Seul le propriétaire du serveur ou un bot owner peut utiliser cette commande.")
+        return
+    if member.bot:
+        await ctx.send("❌ Tu ne peux pas rendre un bot owner.")
+        return
+    if is_bot_owner(ctx.guild.id, member.id):
+        await ctx.send(f"ℹ️ **{member.name}** est déjà bot owner.")
+        return
+    add_bot_owner(ctx.guild.id, member.id)
+    await ctx.send(f"👑 **{member.name}** est maintenant **bot owner** et peut utiliser toutes les commandes du bot !")
+    try:
+        await member.send(f"👑 Tu es maintenant **bot owner** sur **{ctx.guild.name}** ! Tu peux utiliser toutes les commandes du bot.")
+    except discord.Forbidden:
+        pass
+
+@bot.command()
+async def rmowner(ctx, member: discord.Member = None):
+    if member is None:
+        await ctx.send("❌ Utilisation : `!rmowner @utilisateur`")
+        return
+    is_guild_owner = ctx.author.id == ctx.guild.owner_id
+    is_already_owner = is_bot_owner(ctx.guild.id, ctx.author.id)
+    if not is_guild_owner and not is_already_owner:
+        await ctx.send("❌ Seul le propriétaire du serveur ou un bot owner peut utiliser cette commande.")
+        return
+    if not is_bot_owner(ctx.guild.id, member.id):
+        await ctx.send(f"ℹ️ **{member.name}** n'est pas bot owner.")
+        return
+    remove_bot_owner(ctx.guild.id, member.id)
+    await ctx.send(f"✅ **{member.name}** n'est plus bot owner.")
+
+@bot.command()
+async def owners(ctx):
+    data = load_owners()
+    guild_owners = data.get(str(ctx.guild.id), [])
+    if not guild_owners:
+        await ctx.send("ℹ️ Aucun bot owner défini sur ce serveur.")
+        return
+    embed = discord.Embed(title="👑 Bot Owners", color=discord.Color.gold())
+    names = []
+    for uid in guild_owners:
+        member = ctx.guild.get_member(uid)
+        names.append(f"• {member.name}" if member else f"• ID inconnu ({uid})")
+    embed.description = "\n".join(names)
+    await ctx.send(embed=embed)
+
+# ── Coins system ───────────────────────────────────────────────
+
+COINS_FILE     = "coins.json"
+STARTING_COINS = 1000
+DAILY_AMOUNT   = 500
+
+def load_coins():
+    if os.path.exists(COINS_FILE):
+        with open(COINS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_coins(data):
+    with open(COINS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def _default_entry():
+    return {"coins": STARTING_COINS, "last_daily": None, "name": "Inconnu", "avatar": ""}
+
+def get_balance(guild_id, user_id):
+    data = load_coins()
+    entry = data.setdefault(str(guild_id), {}).setdefault(str(user_id), _default_entry())
+    save_coins(data)
+    return entry["coins"]
+
+def update_balance(guild_id, user_id, delta):
+    data = load_coins()
+    g = data.setdefault(str(guild_id), {})
+    e = g.setdefault(str(user_id), _default_entry())
+    e["coins"] = max(0, e["coins"] + delta)
+    save_coins(data)
+    return e["coins"]
+
+def save_user_info(guild_id, user_id, name, avatar):
+    data = load_coins()
+    g = data.setdefault(str(guild_id), {})
+    e = g.setdefault(str(user_id), _default_entry())
+    e["name"] = name
+    e["avatar"] = avatar
+    save_coins(data)
+
+def claim_daily(guild_id, user_id):
+    data = load_coins()
+    g = data.setdefault(str(guild_id), {})
+    e = g.setdefault(str(user_id), {"coins": STARTING_COINS, "last_daily": None})
+    now = datetime.now(timezone.utc)
+    last = e.get("last_daily")
+    if last:
+        diff = now - datetime.fromisoformat(last)
+        if diff.total_seconds() < 86400:
+            remaining = timedelta(seconds=86400) - diff
+            hours, rem = divmod(int(remaining.total_seconds()), 3600)
+            minutes = rem // 60
+            return None, f"{hours}h {minutes}min"
+    e["coins"] += DAILY_AMOUNT
+    e["last_daily"] = now.isoformat()
+    save_coins(data)
+    return e["coins"], None
+
+# ── Mines game ─────────────────────────────────────────────────
+
+TOTAL_CELLS  = 20
+NUM_BOMBS    = 3
+MULTIPLIERS  = [1.0, 1.12, 1.33, 1.59, 1.92, 2.35, 2.92,
+                3.68, 4.73, 6.20, 8.30, 11.5, 16.5, 24.0,
+                36.0, 56.0, 92.0, 175.0]
+active_games = {}  # {(guild_id, user_id): game_state}
+
+def build_mines_embed(game, title="💎 Mines", color=discord.Color.blurple()):
+    safe   = game["safe_count"]
+    mult   = MULTIPLIERS[min(safe, len(MULTIPLIERS) - 1)]
+    payout = int(game["bet"] * mult)
+    revealed_safe = safe
+    embed = discord.Embed(title=title, color=color)
+    embed.add_field(name="💰 Mise",             value=f"{game['bet']} coins", inline=True)
+    embed.add_field(name="✅ Cases sûres",       value=str(revealed_safe),    inline=True)
+    embed.add_field(name="📈 Multiplicateur",    value=f"{mult}x",            inline=True)
+    embed.add_field(name="💵 Gain potentiel",    value=f"{payout} coins",     inline=True)
+    embed.add_field(name="💣 Bombes restantes",  value=str(NUM_BOMBS),        inline=True)
+    embed.set_footer(text="Clique une case ou cashout !")
+    return embed
+
+class MinesView(discord.ui.View):
+    def __init__(self, game, ctx):
+        super().__init__(timeout=180)
+        self.game = game
+        self.ctx  = ctx
+        self._build()
+
+    def _build(self):
+        self.clear_items()
+        for i in range(TOTAL_CELLS):
+            revealed = self.game["revealed"][i]
+            is_bomb  = self.game["grid"][i]
+            if not revealed:
+                btn = discord.ui.Button(
+                    label="⬜", style=discord.ButtonStyle.secondary,
+                    custom_id=f"cell_{i}", row=i // 5
+                )
+                btn.callback = self._make_cb(i)
+            elif is_bomb:
+                btn = discord.ui.Button(
+                    label="💣", style=discord.ButtonStyle.danger,
+                    disabled=True, row=i // 5
+                )
+            else:
+                btn = discord.ui.Button(
+                    label="💎", style=discord.ButtonStyle.success,
+                    disabled=True, row=i // 5
+                )
+            self.add_item(btn)
+
+        if self.game["safe_count"] > 0 and self.game["active"]:
+            mult   = MULTIPLIERS[min(self.game["safe_count"], len(MULTIPLIERS) - 1)]
+            payout = int(self.game["bet"] * mult)
+            cash_btn = discord.ui.Button(
+                label=f"💰 Cashout — {payout} coins",
+                style=discord.ButtonStyle.primary,
+                custom_id="cashout", row=4
+            )
+            cash_btn.callback = self._cashout_cb
+            self.add_item(cash_btn)
+
+    def _make_cb(self, index):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.ctx.author.id:
+                await interaction.response.send_message("❌ Ce n'est pas ton jeu !", ephemeral=True)
+                return
+            if not self.game["active"]:
+                await interaction.response.send_message("❌ Ce jeu est déjà terminé.", ephemeral=True)
+                return
+
+            self.game["revealed"][index] = True
+
+            if self.game["grid"][index]:
+                self.game["active"] = False
+                for i, bomb in enumerate(self.game["grid"]):
+                    if bomb:
+                        self.game["revealed"][i] = True
+                self._build()
+                for item in self.children:
+                    item.disabled = True
+                active_games.pop((self.ctx.guild.id, self.ctx.author.id), None)
+                embed = build_mines_embed(self.game, "💣 BOOM ! Bombe touchée !", discord.Color.red())
+                bal = get_balance(self.ctx.guild.id, self.ctx.author.id)
+                embed.add_field(name="❌ Perdu", value=f"{self.game['bet']} coins perdus\n💰 Solde : {bal} coins", inline=False)
+                await interaction.response.edit_message(embed=embed, view=self)
+            else:
+                self.game["safe_count"] += 1
+                remaining = TOTAL_CELLS - sum(self.game["revealed"])
+                self._build()
+                if remaining == 0 or self.game["safe_count"] == TOTAL_CELLS - NUM_BOMBS:
+                    await self._auto_cashout(interaction)
+                    return
+                embed = build_mines_embed(self.game)
+                await interaction.response.edit_message(embed=embed, view=self)
+        return callback
+
+    async def _cashout_cb(self, interaction: discord.Interaction):
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("❌ Ce n'est pas ton jeu !", ephemeral=True)
+            return
+        await self._do_cashout(interaction)
+
+    async def _auto_cashout(self, interaction):
+        await self._do_cashout(interaction, auto=True)
+
+    async def _do_cashout(self, interaction, auto=False):
+        self.game["active"] = False
+        mult    = MULTIPLIERS[min(self.game["safe_count"], len(MULTIPLIERS) - 1)]
+        payout  = int(self.game["bet"] * mult)
+        new_bal = update_balance(self.ctx.guild.id, self.ctx.author.id, payout)
+        for i, bomb in enumerate(self.game["grid"]):
+            if bomb:
+                self.game["revealed"][i] = True
+        self._build()
+        for item in self.children:
+            item.disabled = True
+        active_games.pop((self.ctx.guild.id, self.ctx.author.id), None)
+        title = "🏆 Toutes les cases trouvées !" if auto else "💰 Cashout !"
+        embed = build_mines_embed(self.game, title, discord.Color.gold())
+        embed.add_field(
+            name="✅ Gagné",
+            value=f"**+{payout} coins** (x{mult})\n💰 Nouveau solde : {new_bal} coins",
+            inline=False
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self):
+        active_games.pop((self.ctx.guild.id, self.ctx.author.id), None)
+
+@bot.command()
+async def mines(ctx, bet: int = None):
+    if bet is None or bet <= 0:
+        await ctx.send("❌ Utilisation : `!mines <mise>` — ex: `!mines 100`")
+        return
+    save_user_info(ctx.guild.id, ctx.author.id, ctx.author.display_name, str(ctx.author.display_avatar.url))
+    key = (ctx.guild.id, ctx.author.id)
+    if key in active_games:
+        await ctx.send("❌ Tu as déjà une partie en cours ! Termine-la d'abord.")
+        return
+    balance = get_balance(ctx.guild.id, ctx.author.id)
+    if bet > balance:
+        await ctx.send(f"❌ Tu n'as que **{balance} coins**. Tu ne peux pas miser autant.")
+        return
+    update_balance(ctx.guild.id, ctx.author.id, -bet)
+    grid = [True] * NUM_BOMBS + [False] * (TOTAL_CELLS - NUM_BOMBS)
+    random.shuffle(grid)
+    game = {
+        "bet": bet, "grid": grid,
+        "revealed": [False] * TOTAL_CELLS,
+        "safe_count": 0, "active": True
+    }
+    active_games[key] = game
+    view  = MinesView(game, ctx)
+    embed = build_mines_embed(game, "💎 Mines — Choisis une case !")
+    embed.description = f"**{ctx.author.name}** mise **{bet} coins**\n3 bombes cachées parmi {TOTAL_CELLS} cases. Bonne chance !"
+    await ctx.send(embed=embed, view=view)
+
+@mines.error
+async def mines_error(ctx, error):
+    if isinstance(error, commands.BadArgument):
+        await ctx.send("❌ Mets un nombre valide. Ex : `!mines 100`")
+
+@bot.command(aliases=["bal", "coins"])
+async def balance(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    save_user_info(ctx.guild.id, target.id, target.display_name, str(target.display_avatar.url))
+    bal = get_balance(ctx.guild.id, target.id)
+    embed = discord.Embed(
+        title=f"💰 Solde de {target.name}",
+        description=f"**{bal} coins**",
+        color=discord.Color.gold()
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def daily(ctx):
+    save_user_info(ctx.guild.id, ctx.author.id, ctx.author.display_name, str(ctx.author.display_avatar.url))
+    new_bal, wait = claim_daily(ctx.guild.id, ctx.author.id)
+    if wait:
+        await ctx.send(f"⏳ Tu as déjà pris ton daily ! Reviens dans **{wait}**.")
+    else:
+        embed = discord.Embed(
+            title="🎁 Daily réclamé !",
+            description=f"Tu as reçu **{DAILY_AMOUNT} coins** !\n💰 Nouveau solde : **{new_bal} coins**",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+
+# ── Events de connexion ────────────────────────────────────────
+
+@bot.event
+async def on_disconnect():
+    print("⚠️  Bot déconnecté de Discord. Tentative de reconnexion...")
+
+@bot.event
+async def on_resumed():
+    print("✅  Session reprise — bot reconnecté !")
+
+# ── Start avec reconnexion automatique ─────────────────────────
+
+import asyncio, sys
+
+async def launch():
+    raw = os.environ.get("DISCORD_TOKEN", "")
+    token = raw.strip()
+    if not token:
+        print("❌  DISCORD_TOKEN manquant. Ajoutez-le dans les Secrets.")
+        sys.exit(1)
+    print(f"🔄  Démarrage du bot...")
+    try:
+        async with bot:
+            await bot.start(token, reconnect=True)
+        print("✅  Bot arrêté proprement.")
+    except discord.errors.LoginFailure as e:
+        print(f"❌  Token refusé par Discord : {e}")
+        print("    → Allez sur discord.com/developers → Bot → Reset Token")
+        sys.exit(1)
+    except Exception as e:
+        print(f"⚠️  Crash : {type(e).__name__}: {e}")
+        print("⏳  Redémarrage dans 5s...")
+        import time; time.sleep(5)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+asyncio.run(launch())
+@bot.command(name="leaderboard", aliases=["lb", "classement"])
+async def leaderboard(ctx):
+    # 1. Charger les données du fichier coins.json
+    try:
+        with open("coins.json", "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        await ctx.send("❌ Aucun classement disponible pour le moment (fichier introuvable).")
+        return
+
+    # 2. Trier les utilisateurs par nombre de coins décroissant
+    # data.items() donne (user_id, solde) -> on trie sur le solde (x[1])
+    sorted_players = sorted(data.items(), key=lambda x: x[1], reverse=True)
+
+    if not sorted_players:
+        await ctx.send("🪙 Personne n'a encore de coins sur ce serveur !")
+        return
+
+    # 3. Construire le texte du classement (Top 10 maximum)
+    leaderboard_text = "🏆 **CLASSEMENT DES PLUS RICHES (AKATSUKI)** 🏆\n\n"
+
+    count = 0
+    for user_id, coins in sorted_players:
+        if count >= 10:  # On s'arrête au top 10
+            break
+
+        # On essaie de récupérer le nom de l'utilisateur sur le serveur
+        member = ctx.guild.get_member(int(user_id))
+        if member:
+            username = member.display_name
+        else:
+            username = f"Utilisateur inconnu ({user_id})"
+
+        # Petites médailles pour le podium
+        if count == 0:
+            medal = "🥇"
+        elif count == 1:
+            medal = "🥈"
+        elif count == 2:
+            medal = "🥉"
+        else:
+            medal = f"#{count + 1}"
+
+        leaderboard_text += f"{medal} **{username}** — {coins} coins 🪙\n"
+        count += 1
+
+    # 4. Envoyer le message final dans le salon Discord
+    await ctx.send(leaderboard_text)
+asyncio.run(launch())
